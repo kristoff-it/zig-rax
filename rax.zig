@@ -3,9 +3,8 @@ const std = @import("std");
 fn RaxNode(comptime V: type) type {
     return struct {
         nodeType: union(enum) {
-            isKey: V,
-            isNull,
-            isLink,
+            Key: V,
+            Link,
         },
         isCompressed: bool,
         chars: []u8,
@@ -20,7 +19,7 @@ fn RaxNode(comptime V: type) type {
             errdefer allocator.free(childrenSlice);
 
             return Self{
-                .nodeType = .isLink,
+                .nodeType = .Link,
                 .isCompressed = false,
                 .chars = charsSlice,
                 .children = childrenSlice,
@@ -41,7 +40,7 @@ fn RaxNode(comptime V: type) type {
             errdefer allocator.free(childrenSlice);
 
             childrenSlice[0] = Self{
-                .nodeType = .isLink,
+                .nodeType = .Link,
                 .isCompressed = false,
                 .chars = &[0]u8{},
                 .children = &[0]Self{},
@@ -89,20 +88,49 @@ pub fn Rax(comptime V: type) type {
             self.numNodes -= 1;
         }
 
-        pub fn insert(self: *Self, key: []const u8, value: V) !?V {
+        pub const InsertResult = union(enum) {
+            New,
+            Replaced: V,
+        };
+
+        pub fn insert(self: *Self, key: []const u8, value: V) !InsertResult {
             return insertImpl(self, key, value, false);
         }
-        pub fn insertOverride(self: *Self, key: []const u8, value: V) !?V {
+        pub fn insertOverride(self: *Self, key: []const u8, value: V) !InsertResult {
             return insertImpl(self, key, value, true);
         }
 
         // TODO: override is not comptime. Should it be?
-        fn insertImpl(self: *Self, key: []const u8, value: V, override: bool) !?V {
+        fn insertImpl(self: *Self, key: []const u8, value: V, override: bool) !InsertResult {
             var wk = self.lowWalk(key);
 
             var i = wk.bytesMatched;
             var currentNode = wk.stopNode;
+            var j = wk.splitPos;
             // var parentLink = wk.pLink;
+
+            // /* If i == len we walked following the whole string. If we are not
+            // * in the middle of a compressed node, the string is either already
+            // * inserted or this middle node is currently not a key, but can represent
+            // * our key. We have just to reallocate the node and make space for the
+            // * data pointer. */
+            if (i == key.len and
+                (!currentNode.isCompressed or wk.splitPos == 0))
+            {
+                switch (currentNode.nodeType) {
+                    .Link => {
+                        currentNode.nodeType = .{ .Key = value };
+                        self.numElements += 1;
+                        return .New;
+                    },
+                    .Key => |oldValue| {
+                        if (override) {
+                            currentNode.nodeType = .{ .Key = value };
+                        }
+                        return InsertResult{ .Replaced = oldValue };
+                    },
+                }
+            }
 
             while (i < key.len) {
                 if (currentNode.chars.len == 0 and key.len - i > 1) {
@@ -126,13 +154,12 @@ pub fn Rax(comptime V: type) type {
                 currentNode = &currentNode.children[0]; // TODO: review when implementing the else branch
             }
 
-            switch (currentNode.nodeType) {
-                .isKey => {},
-                else => self.numElements += 1,
+            if (currentNode.nodeType == .Link) {
+                self.numElements += 1;
             }
 
-            currentNode.nodeType = .{ .isKey = value };
-            return null;
+            currentNode.nodeType = .{ .Key = value };
+            return .New;
         }
 
         // TODO: should s be named key? Do we ever search
@@ -195,7 +222,7 @@ pub fn Rax(comptime V: type) type {
 
             switch (node.nodeType) {
                 else => {},
-                .isKey => |value| {
+                .Key => |value| {
                     if (@TypeOf(value) != void) {
                         std.debug.warn("={x}", .{value});
                     }
