@@ -2,8 +2,6 @@ const std = @import("std");
 
 fn RaxNode(comptime V: type) type {
     return struct {
-        const Self = @This();
-
         nodeType: union(enum) {
             isKey: V,
             isNull,
@@ -11,26 +9,22 @@ fn RaxNode(comptime V: type) type {
         },
         isCompressed: bool,
         chars: []u8,
-        children: []*Self,
+        children: []Self,
 
-        fn init(allocator: *std.mem.Allocator, children: usize) !*Self {
-            const result = try allocator.create(Self);
-            errdefer allocator.destroy(result);
-
+        const Self = @This();
+        fn init(allocator: *std.mem.Allocator, children: usize) !Self {
             const charsSlice = try allocator.alloc(u8, children);
             errdefer allocator.free(charsSlice);
 
-            const childrenSlice = try allocator.alloc(*Self, children);
+            const childrenSlice = try allocator.alloc(Self, children);
             errdefer allocator.free(childrenSlice);
 
-            result.* = Self{
+            return Self{
                 .nodeType = .isLink,
                 .isCompressed = false,
                 .chars = charsSlice,
                 .children = childrenSlice,
             };
-
-            return result;
         }
 
         fn makeCompressed(self: *Self, allocator: *std.mem.Allocator, s: []const u8) !void {
@@ -38,26 +32,24 @@ fn RaxNode(comptime V: type) type {
                 @panic("tried to call makeCompressed on an unsuitable node");
             }
 
-            var child = try Self.init(allocator, 0);
-            errdefer child.deinit(allocator);
-
             const charsSlice = try allocator.alloc(u8, s.len);
             errdefer allocator.free(charsSlice);
 
             std.mem.copy(u8, charsSlice, s);
 
-            const childrenSlice = try allocator.alloc(*Self, 1);
+            const childrenSlice = try allocator.alloc(Self, 1);
             errdefer allocator.free(childrenSlice);
-            childrenSlice[0] = child;
+
+            childrenSlice[0] = Self{
+                .nodeType = .isLink,
+                .isCompressed = false,
+                .chars = &[0]u8{},
+                .children = &[0]Self{},
+            };
 
             self.isCompressed = true;
             self.chars = charsSlice;
             self.children = childrenSlice;
-        }
-
-        fn deinit(self: Self, allocator: *std.mem.Allocator) void {
-            allocator.free(self.chars);
-            allocator.free(self.children);
         }
     };
 }
@@ -67,7 +59,7 @@ pub fn Rax(comptime V: type) type {
 
     return struct {
         allocator: *std.mem.Allocator,
-        head: *NodeT,
+        head: NodeT,
         numElements: u64,
         numNodes: u64,
 
@@ -76,13 +68,25 @@ pub fn Rax(comptime V: type) type {
             return Self{
                 .allocator = allocator,
                 .head = try NodeT.init(allocator, 0),
-                .numNodes = 0,
+                .numNodes = 1,
                 .numElements = 0,
             };
         }
 
-        pub fn deinit(self: Self) void {
-            self.allocator.destroy(self.head);
+        pub fn deinit(self: *Self) void {
+            self.recursiveDeinit(&self.head);
+            if (self.numNodes != 0) {
+                @panic("free didn't free!");
+            }
+        }
+
+        fn recursiveDeinit(self: *Self, node: *NodeT) void {
+            self.allocator.free(node.chars);
+            for (node.children) |*ch| {
+                self.recursiveDeinit(ch);
+            }
+            self.allocator.free(node.children);
+            self.numNodes -= 1;
         }
 
         pub fn insert(self: *Self, key: []const u8, value: V) !?V {
@@ -98,31 +102,28 @@ pub fn Rax(comptime V: type) type {
 
             var i = wk.bytesMatched;
             var currentNode = wk.stopNode;
-            var parentLink = wk.pLink;
+            // var parentLink = wk.pLink;
 
             while (i < key.len) {
                 if (currentNode.chars.len == 0 and key.len - i > 1) {
-                    var comprSize = key.len - i;
+                    var chunkSize = key.len - i;
 
                     // this should be maxsize of u29 in the
                     // real implementation.
-                    if (comprSize > std.math.maxInt(usize)) {
-                        comprSize = std.math.maxInt(usize);
+                    if (chunkSize > std.math.maxInt(usize)) {
+                        chunkSize = std.math.maxInt(usize);
                     }
 
                     // TODO: error handling procedure
                     try currentNode.makeCompressed(self.allocator, key[i..]);
 
-                    // parentLink.* = currentNode;
-                    // parentLink = &currentNode.children[0];
-
-                    i += comprSize;
+                    i += chunkSize;
                 } else {
                     // TODO
                     @panic("TODO");
                 }
                 self.numNodes += 1;
-                currentNode = currentNode.children[0]; // TODO: review when implementing the else branch
+                currentNode = &currentNode.children[0]; // TODO: review when implementing the else branch
             }
 
             switch (currentNode.nodeType) {
@@ -141,13 +142,11 @@ pub fn Rax(comptime V: type) type {
         const walkResult = struct {
             bytesMatched: usize,
             stopNode: *NodeT,
-            pLink: **NodeT,
             splitPos: usize, // In real impl it's u29
         };
 
         fn lowWalk(self: *Self, s: []const u8) walkResult {
-            var node = self.head;
-            var parentLink: **NodeT = &self.head;
+            var node = &self.head;
 
             var i: usize = 0;
             var j: usize = 0;
@@ -169,22 +168,20 @@ pub fn Rax(comptime V: type) type {
                     i += 1;
                 }
 
-                if (node.isCompressed) j = 0;
-                node = node.children[j];
-                parentLink = &node.children[j];
+                if (node.isCompressed) j = 0; // TODO: check if really needed.
+                node = &node.children[j];
                 j = 0;
             }
 
             return walkResult{
                 .bytesMatched = i,
                 .stopNode = node,
-                .pLink = parentLink,
                 .splitPos = j,
             };
         }
 
-        pub fn show(self: Self) void {
-            recursiveShow(0, 0, self.head);
+        pub fn show(self: *Self) void {
+            recursiveShow(0, 0, &self.head);
             std.debug.warn("\n", .{});
         }
 
@@ -213,7 +210,7 @@ pub fn Rax(comptime V: type) type {
                 }
             }
 
-            for (node.children) |ch, idx| {
+            for (node.children) |*ch, idx| {
                 if (node.children.len > 1) {
                     std.debug.warn("\n", .{});
                     var i: usize = 0;
@@ -230,7 +227,7 @@ pub fn Rax(comptime V: type) type {
 
 test "works" {
     const MyRax = Rax(void);
-    const r = try MyRax.init(std.testing.allocator);
+    var r = try MyRax.init(std.testing.allocator);
     defer r.deinit();
 }
 
