@@ -6,9 +6,10 @@ pub fn main() !void {
     var r = try MyRax.init(std.testing.allocator);
     defer r.deinit();
 
-    const r1 = try r.insert("banana", 1);
-    std.debug.warn("r1={}\n", .{r1});
-    const r2 = try r.insertOverride("banana", 2);
-    std.debug.warn("r2={}\n", .{r2});
+    const r1 = try r.insert("annibale", 1);
+    std.debug.warn("r1={} nodes={}\n", .{ r1, r.numNodes });
+    const r2 = try r.insert("annientare", 2);
+    std.debug.warn("r2={} nodes={}\n", .{ r2, r.numNodes });
+
     r.show();
 }

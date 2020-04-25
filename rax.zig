@@ -6,28 +6,49 @@ fn RaxNode(comptime V: type) type {
             Key: V,
             Link,
         },
-        isCompressed: bool,
-        chars: []u8,
-        children: []Self,
+        layout: union(enum) {
+            Compressed: struct {
+                chars: []u8,
+                nextPtr: *Self,
+            },
+            Branching: []Branch,
+        },
 
         const Self = @This();
-        fn init(allocator: *std.mem.Allocator, children: usize) !Self {
-            const charsSlice = try allocator.alloc(u8, children);
-            errdefer allocator.free(charsSlice);
+        const Branch = struct {
+            char: u8,
+            child: Self,
+        };
 
-            const childrenSlice = try allocator.alloc(Self, children);
-            errdefer allocator.free(childrenSlice);
+        fn init(allocator: *std.mem.Allocator, children: usize) !Self {
+            const branchSlice = try allocator.alloc(Branch, children);
+            errdefer allocator.free(branchSlice);
 
             return Self{
                 .nodeType = .Link,
-                .isCompressed = false,
-                .chars = charsSlice,
-                .children = childrenSlice,
+                .layout = .{ .Branching = branchSlice },
             };
         }
 
+        fn deinit(self: *Self, allocator: *std.mem.Allocator, deletedNodes: u64) u64 {
+            var newDeletedNodes = deletedNodes;
+            switch (self.layout) {
+                .Compressed => |c| {
+                    allocator.free(c.chars);
+                    newDeletedNodes += c.nextPtr.deinit(allocator, deletedNodes);
+                    allocator.destroy(c.nextPtr);
+                    newDeletedNodes += 1;
+                },
+                .Branching => |branches| {
+                    for (branches) |*b| newDeletedNodes += b.child.deinit(allocator, deletedNodes);
+                    allocator.free(branches);
+                },
+            }
+            return newDeletedNodes;
+        }
+
         fn makeCompressed(self: *Self, allocator: *std.mem.Allocator, s: []const u8) !void {
-            if (self.isCompressed or self.chars.len != 0 or self.children.len != 0) {
+            if (self.layout == .Compressed or self.layout.Branching.len != 0) {
                 @panic("tried to call makeCompressed on an unsuitable node");
             }
 
@@ -36,19 +57,22 @@ fn RaxNode(comptime V: type) type {
 
             std.mem.copy(u8, charsSlice, s);
 
-            const childrenSlice = try allocator.alloc(Self, 1);
-            errdefer allocator.free(childrenSlice);
+            const nextChild = try allocator.create(Self);
+            errdefer allocator.destroy(nextChild);
 
-            childrenSlice[0] = Self{
+            // Initialize the new child
+            nextChild.* = Self{
                 .nodeType = .Link,
-                .isCompressed = false,
-                .chars = &[0]u8{},
-                .children = &[0]Self{},
+                .layout = .{ .Branching = &[0]Branch{} },
             };
 
-            self.isCompressed = true;
-            self.chars = charsSlice;
-            self.children = childrenSlice;
+            // Set the current node to Compressed
+            self.layout = .{
+                .Compressed = .{
+                    .chars = charsSlice,
+                    .nextPtr = nextChild,
+                },
+            };
         }
     };
 }
@@ -73,19 +97,11 @@ pub fn Rax(comptime V: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.recursiveDeinit(&self.head);
-            if (self.numNodes != 0) {
+            const deletedNodes = 1 + self.head.deinit(self.allocator, 0);
+            if (self.numNodes != deletedNodes) {
+                std.debug.warn("numnodes = {} deleted = {}", .{ self.numNodes, deletedNodes });
                 @panic("free didn't free!");
             }
-        }
-
-        fn recursiveDeinit(self: *Self, node: *NodeT) void {
-            self.allocator.free(node.chars);
-            for (node.children) |*ch| {
-                self.recursiveDeinit(ch);
-            }
-            self.allocator.free(node.children);
-            self.numNodes -= 1;
         }
 
         pub const InsertResult = union(enum) {
@@ -115,7 +131,7 @@ pub fn Rax(comptime V: type) type {
             // * our key. We have just to reallocate the node and make space for the
             // * data pointer. */
             if (i == key.len and
-                (!currentNode.isCompressed or wk.splitPos == 0))
+                (currentNode.layout != .Compressed or wk.splitPos == 0))
             {
                 switch (currentNode.nodeType) {
                     .Link => {
@@ -132,8 +148,91 @@ pub fn Rax(comptime V: type) type {
                 }
             }
 
+            // Algo 1
+            if (currentNode.layout == .Compressed and i != key.len) {
+                var currentData = &currentNode.layout.Compressed;
+                if (j == currentData.chars.len - 1 or j == key.len - 1) {
+                    @panic("j shouldn't be the last char");
+                }
+
+                // ----------------
+
+                // Create the split node (the split node has a .Branching layout)
+                var branchingNodePtr = try self.allocator.create(NodeT);
+                branchingNodePtr.* = try NodeT.init(self.allocator, 2);
+                self.numNodes += 1;
+                // errdefer branchingNode.deinit();
+                // TODO: error handling
+
+                // Branch to the child containing the current node's suffix.
+                {
+                    // Create the node that contains the suffix of this compressed node
+                    // that we are breaking up. This new node will then point (.nextPtr) to
+                    // the current child of this node.
+                    const suffixLen = currentData.chars.len - j;
+                    const suffix = try self.allocator.alloc(u8, suffixLen);
+                    errdefer self.allocator.free(suffix);
+
+                    // Copy the string suffix over the new array
+                    // We do +1 because `j` points to the char where the two strings
+                    // diverge and that char will go in another intermediary branching
+                    // node.
+                    std.mem.copy(u8, suffix, currentData.chars[j..]);
+                    branchingNodePtr.layout.Branching[0] = NodeT.Branch{
+                        .char = currentData.chars[j],
+                        .child = .{
+                            .nodeType = .Link, // TODO check
+                            .layout = .{
+                                .Compressed = .{
+                                    .chars = suffix,
+                                    .nextPtr = currentData.nextPtr,
+                                },
+                            },
+                        },
+                    };
+                }
+
+                // Branch containing the new suffix that we are creating for key.
+                {
+                    // const suffixLen = key.len - j;
+                    // const suffix = try self.allocator.alloc(u8, suffixLen);
+                    // errdefer self.allocator.free(suffix);
+
+                    // Copy the string suffix over the new array
+                    // We do +1 because `j` points to the char where the two strings
+                    // diverge and that char will go in another intermediary branching
+                    // node.
+                    // std.mem.copy(u8, suffix, key[j..]);
+                    branchingNodePtr.layout.Branching[1] = NodeT.Branch{
+                        .char = key[j],
+                        .child = .{
+                            .nodeType = .Link,
+                            .layout = .{
+                                .Branching = &[0]NodeT.Branch{},
+                            },
+                        },
+                    };
+                    // TODO: is this always going to be like this?
+                    // try branchingNodePtr.layout.Branching[1].child.makeCompressed(self.allocator, suffix);
+                    // self.numNodes += 1;
+                }
+
+                // Trim the current node by removing the suffix + branching point and
+                // set nextPtr to the new branching node just created.
+                currentData.chars = self.allocator.shrink(currentData.chars, j);
+                currentData.nextPtr = branchingNodePtr;
+                self.numElements += 1;
+                currentNode = &branchingNodePtr.layout.Branching[1].child;
+                i += 1;
+            }
+
             while (i < key.len) {
-                if (currentNode.chars.len == 0 and key.len - i > 1) {
+                const isEmpty = switch (currentNode.layout) {
+                    .Compressed => |c| c.chars.len == 0,
+                    .Branching => |b| b.len == 0,
+                };
+
+                if (isEmpty and key.len - i > 1) {
                     var chunkSize = key.len - i;
 
                     // this should be maxsize of u29 in the
@@ -147,11 +246,15 @@ pub fn Rax(comptime V: type) type {
 
                     i += chunkSize;
                 } else {
-                    // TODO
-                    @panic("TODO");
+                    std.debug.warn("char={c} node={}\n", .{ key[i], currentNode.* });
+                    unreachable;
                 }
                 self.numNodes += 1;
-                currentNode = &currentNode.children[0]; // TODO: review when implementing the else branch
+
+                currentNode = switch (currentNode.layout) {
+                    .Compressed => |c| c.nextPtr,
+                    .Branching => |b| &(b[0].child),
+                };
             }
 
             if (currentNode.nodeType == .Link) {
@@ -177,26 +280,36 @@ pub fn Rax(comptime V: type) type {
 
             var i: usize = 0;
             var j: usize = 0;
-            while (node.chars.len > 0 and i < s.len) {
-                if (node.isCompressed) {
-                    j = 0;
-                    while (j < node.chars.len and i < s.len) {
-                        if (node.chars[j] != s[i]) break;
-                        j += 1;
+            while (i < s.len) {
+                switch (node.layout) {
+                    .Compressed => |data| {
+                        if (data.chars.len == 0) break;
+
+                        j = 0;
+                        while (j < data.chars.len and i < s.len) {
+                            if (data.chars[j] != s[i]) break;
+                            j += 1;
+                            i += 1;
+                        }
+                        if (j != data.chars.len) break;
+                    },
+                    .Branching => |branches| {
+                        if (branches.len == 0) break;
+
+                        // rax does a linear scan, so we do too.
+                        while (j < branches.len and i < s.len) : (j += 1) {
+                            if (branches[j].char == s[i]) break;
+                        }
+                        if (j == branches.len) break;
                         i += 1;
-                    }
-                    if (j != node.chars.len) break;
-                } else {
-                    // rax does a linear scan, so we do too.
-                    while (j < node.chars.len and i < s.len) : (j += 1) {
-                        if (node.chars[j] == s[i]) break;
-                    }
-                    if (j == node.chars.len) break;
-                    i += 1;
+                    },
                 }
 
-                if (node.isCompressed) j = 0; // TODO: check if really needed.
-                node = &node.children[j];
+                node = switch (node.layout) {
+                    .Compressed => |c| c.nextPtr,
+                    .Branching => |b| &(b[j].child),
+                };
+
                 j = 0;
             }
 
@@ -214,11 +327,25 @@ pub fn Rax(comptime V: type) type {
 
         fn recursiveShow(level: usize, lp: usize, node: *NodeT) void {
             var lpad = lp;
-            const start: u8 = if (node.isCompressed) '"' else '[';
-            const end: u8 = if (node.isCompressed) '"' else ']';
+            const isCompressed = node.layout == .Compressed;
+            const start: u8 = if (isCompressed) '"' else '[';
+            const end: u8 = if (isCompressed) '"' else ']';
 
-            std.debug.warn("{c}{}{c}", .{ start, node.chars, end });
-            var numchars = 2 + node.chars.len;
+            var numchars: usize = 2;
+            switch (node.layout) {
+                .Compressed => |compressed| {
+                    std.debug.warn("{c}{}{c}", .{ start, compressed.chars, end });
+                    numchars += compressed.chars.len;
+                },
+                .Branching => |branches| {
+                    std.debug.warn("{c}", .{start});
+                    for (branches) |b| {
+                        std.debug.warn("{c}", .{b.char});
+                    }
+                    std.debug.warn("{c}", .{end});
+                    numchars += branches.len;
+                },
+            }
 
             switch (node.nodeType) {
                 else => {},
@@ -231,22 +358,34 @@ pub fn Rax(comptime V: type) type {
             }
 
             if (level > 0) {
-                lpad += if (node.children.len > 1) @as(usize, 7) else @as(usize, 4);
-                if (node.children.len == 1) {
-                    lpad += numchars;
-                }
+                lpad += switch (node.layout) {
+                    .Compressed => @as(usize, 4),
+                    .Branching => |b| switch (b.len) {
+                        0 => @as(usize, 4),
+                        1 => @as(usize, 4) + numchars,
+                        else => @as(usize, 7),
+                    },
+                };
             }
 
-            for (node.children) |*ch, idx| {
-                if (node.children.len > 1) {
-                    std.debug.warn("\n", .{});
-                    var i: usize = 0;
-                    while (i < lpad) : (i += 1) std.debug.warn(" ", .{});
-                    std.debug.warn(" `-({}) ", .{node.chars[idx]});
-                } else {
+            switch (node.layout) {
+                .Compressed => |compressed| {
                     std.debug.warn(" -> ", .{});
-                }
-                recursiveShow(level + 1, lpad, ch);
+                    recursiveShow(level + 1, lpad, compressed.nextPtr);
+                },
+                .Branching => |branches| {
+                    for (branches) |*br, idx| {
+                        if (branches.len > 1) {
+                            std.debug.warn("\n", .{});
+                            var i: usize = 0;
+                            while (i < lpad) : (i += 1) std.debug.warn(" ", .{});
+                            std.debug.warn(" `-({c}) ", .{br.char});
+                        } else {
+                            std.debug.warn(" -> ", .{});
+                        }
+                        recursiveShow(level + 1, lpad, &br.child);
+                    }
+                },
             }
         }
     };
