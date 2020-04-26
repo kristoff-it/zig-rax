@@ -2,14 +2,11 @@ const std = @import("std");
 
 fn RaxNode(comptime V: type) type {
     return struct {
-        nodeType: union(enum) {
-            Key: V,
-            Link,
-        },
+        key: ?V,
         layout: union(enum) {
             Compressed: struct {
                 chars: []u8,
-                nextPtr: *Self,
+                next: *Self,
             },
             Branching: []Branch,
         },
@@ -17,33 +14,72 @@ fn RaxNode(comptime V: type) type {
         const Self = @This();
         const Branch = struct {
             char: u8,
-            child: Self,
+            child: *Self,
         };
 
-        fn init(allocator: *std.mem.Allocator, children: usize) !Self {
-            const branchSlice = try allocator.alloc(Branch, children);
-            errdefer allocator.free(branchSlice);
+        fn initCompressedNode(allocator: *std.mem.Allocator, chars: []const u8, next: *Self) !*Self {
+            const charsCopy = try allocator.alloc(u8, chars.len);
+            errdefer allocator.free(charsCopy);
+            std.mem.copy(u8, charsCopy, chars);
 
-            return Self{
-                .nodeType = .Link,
-                .layout = .{ .Branching = branchSlice },
+            var newNode = try allocator.create(Self);
+            newNode.* = .{
+                .key = null,
+                .layout = .{
+                    .Compressed = .{
+                        .chars = charsCopy,
+                        .next = next,
+                    },
+                },
             };
+            return newNode;
+        }
+
+        fn initBranchNode(comptime N: comptime_int, allocator: *std.mem.Allocator, chars: [N]u8, children: [N]*Self) !*Self {
+            var branches = try allocator.alloc(Self.Branch, N);
+            errdefer allocator.free(branches);
+
+            comptime var i: usize = 0;
+            inline while (i < N) : (i += 1) {
+                branches[i] = .{
+                    .char = chars[i],
+                    .child = children[i],
+                };
+            }
+
+            var newNode = try allocator.create(Self);
+            newNode.* = .{
+                .key = null,
+                .layout = .{
+                    .Branching = branches,
+                },
+            };
+
+            return newNode;
+        }
+
+        fn initEmpty(allocator: *std.mem.Allocator) !*Self {
+            var result = try allocator.create(Self);
+            result.* = Self{
+                .key = null,
+                .layout = .{ .Branching = &[0]Branch{} },
+            };
+            return result;
         }
 
         fn deinit(self: *Self, allocator: *std.mem.Allocator, deletedNodes: u64) u64 {
-            var newDeletedNodes = deletedNodes;
+            var newDeletedNodes = 1 + deletedNodes;
             switch (self.layout) {
                 .Compressed => |c| {
                     allocator.free(c.chars);
-                    newDeletedNodes += c.nextPtr.deinit(allocator, deletedNodes);
-                    allocator.destroy(c.nextPtr);
-                    newDeletedNodes += 1;
+                    newDeletedNodes += c.next.deinit(allocator, deletedNodes);
                 },
                 .Branching => |branches| {
                     for (branches) |*b| newDeletedNodes += b.child.deinit(allocator, deletedNodes);
                     allocator.free(branches);
                 },
             }
+            allocator.destroy(self);
             return newDeletedNodes;
         }
 
@@ -62,7 +98,7 @@ fn RaxNode(comptime V: type) type {
 
             // Initialize the new child
             nextChild.* = Self{
-                .nodeType = .Link,
+                .key = null,
                 .layout = .{ .Branching = &[0]Branch{} },
             };
 
@@ -70,7 +106,7 @@ fn RaxNode(comptime V: type) type {
             self.layout = .{
                 .Compressed = .{
                     .chars = charsSlice,
-                    .nextPtr = nextChild,
+                    .next = nextChild,
                 },
             };
         }
@@ -82,7 +118,7 @@ pub fn Rax(comptime V: type) type {
 
     return struct {
         allocator: *std.mem.Allocator,
-        head: NodeT,
+        head: *NodeT,
         numElements: u64,
         numNodes: u64,
 
@@ -90,14 +126,14 @@ pub fn Rax(comptime V: type) type {
         pub fn init(allocator: *std.mem.Allocator) !Self {
             return Self{
                 .allocator = allocator,
-                .head = try NodeT.init(allocator, 0),
+                .head = try NodeT.initEmpty(allocator),
                 .numNodes = 1,
                 .numElements = 0,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            const deletedNodes = 1 + self.head.deinit(self.allocator, 0);
+            const deletedNodes = self.head.deinit(self.allocator, 0);
             if (self.numNodes != deletedNodes) {
                 std.debug.warn("numnodes = {} deleted = {}", .{ self.numNodes, deletedNodes });
                 @panic("free didn't free!");
@@ -123,7 +159,6 @@ pub fn Rax(comptime V: type) type {
             var i = wk.bytesMatched;
             var currentNode = wk.stopNode;
             var j = wk.splitPos;
-            // var parentLink = wk.pLink;
 
             // /* If i == len we walked following the whole string. If we are not
             // * in the middle of a compressed node, the string is either already
@@ -133,97 +168,107 @@ pub fn Rax(comptime V: type) type {
             if (i == key.len and
                 (currentNode.layout != .Compressed or wk.splitPos == 0))
             {
-                switch (currentNode.nodeType) {
-                    .Link => {
-                        currentNode.nodeType = .{ .Key = value };
-                        self.numElements += 1;
-                        return .New;
-                    },
-                    .Key => |oldValue| {
-                        if (override) {
-                            currentNode.nodeType = .{ .Key = value };
-                        }
-                        return InsertResult{ .Replaced = oldValue };
-                    },
+                if (currentNode.key) |oldValue| {
+                    if (override) {
+                        currentNode.key = value;
+                    }
+                    return InsertResult{ .Replaced = oldValue };
+                } else {
+                    currentNode.key = value;
+                    self.numElements += 1;
+                    return .New;
                 }
             }
 
             // Algo 1
             if (currentNode.layout == .Compressed and i != key.len) {
                 var currentData = &currentNode.layout.Compressed;
-                if (j == currentData.chars.len - 1 or j == key.len - 1) {
-                    @panic("j shouldn't be the last char");
-                }
 
-                // ----------------
+                // We are breaking up the current node in two parts.
+                // We will need to create a branching node for the point of devergence,
+                // and other nodes to make space for the new suffixes (the old suffix
+                // from this node, and the new suffix for the remaining chars in key).
+                // We start by creating the suffix nodes (+ eventual extra emtpy nodes),
+                // and at the end of the procedure we create the branching node that they
+                // will have to be connected to.
 
-                // Create the split node (the split node has a .Branching layout)
-                var branchingNodePtr = try self.allocator.create(NodeT);
-                branchingNodePtr.* = try NodeT.init(self.allocator, 2);
-                self.numNodes += 1;
-                // errdefer branchingNode.deinit();
-                // TODO: error handling
+                // Create the node containing the current node's suffix (skipping j,
+                // the char that will be put in a branching node).
+                var oldSuffixNode = try self.createSuffixForOldElement(currentNode, j + 1);
 
-                // Branch to the child containing the current node's suffix.
+                // Create an empty node for the new suffix. It will be populated by
+                // the node downstream (the while loop).
+                var newSuffixNode = try NodeT.initEmpty(self.allocator);
+
+                // Create the branching node for the split-off point and connect
+                // the nodes we previously created to it.
+                var branchingNode: *NodeT = undefined;
+                var newSuffixSlot: usize = undefined;
                 {
-                    // Create the node that contains the suffix of this compressed node
-                    // that we are breaking up. This new node will then point (.nextPtr) to
-                    // the current child of this node.
-                    const suffixLen = currentData.chars.len - j;
-                    const suffix = try self.allocator.alloc(u8, suffixLen);
-                    errdefer self.allocator.free(suffix);
+                    var oldSuffixSlot: usize = undefined;
+                    // We must maintain lexicographial ordering for the branches in
+                    // the new branching node.
+                    if (currentData.chars[j] < key[i]) {
+                        oldSuffixSlot = 0;
+                        newSuffixSlot = 1;
+                    } else {
+                        oldSuffixSlot = 1;
+                        newSuffixSlot = 0;
+                    }
 
-                    // Copy the string suffix over the new array
-                    // We do +1 because `j` points to the char where the two strings
-                    // diverge and that char will go in another intermediary branching
-                    // node.
-                    std.mem.copy(u8, suffix, currentData.chars[j..]);
-                    branchingNodePtr.layout.Branching[0] = NodeT.Branch{
-                        .char = currentData.chars[j],
-                        .child = .{
-                            .nodeType = .Link, // TODO check
-                            .layout = .{
-                                .Compressed = .{
-                                    .chars = suffix,
-                                    .nextPtr = currentData.nextPtr,
-                                },
-                            },
-                        },
-                    };
+                    var chars: [2]u8 = undefined;
+                    chars[oldSuffixSlot] = currentData.chars[j];
+                    chars[newSuffixSlot] = key[i];
+
+                    var children: [2]*NodeT = undefined;
+                    children[oldSuffixSlot] = oldSuffixNode;
+                    children[newSuffixSlot] = newSuffixNode;
+
+                    // If we are splitting right at the beginning, change the current node
+                    // to be the branching node, otherwise allocate a new one.
+                    if (j == 0) {
+                        var branches = try self.allocator.alloc(NodeT.Branch, 2);
+                        branches[oldSuffixSlot] = .{
+                            .char = chars[oldSuffixSlot],
+                            .child = children[oldSuffixSlot],
+                        };
+                        branches[newSuffixSlot] = .{
+                            .char = chars[newSuffixSlot],
+                            .child = children[newSuffixSlot],
+                        };
+
+                        branchingNode = currentNode;
+                        branchingNode.layout = .{
+                            .Branching = branches,
+                        };
+                    } else {
+                        // Create the split node (the split node has a .Branching layout)
+                        branchingNode = try NodeT.initBranchNode(2, self.allocator, chars, children);
+                        self.numNodes += 1;
+                    }
+
+                    // The rest of the algorithm will add the actual new key suffix node.
+                    // In this segment we only setup the branching part.
                 }
 
-                // Branch containing the new suffix that we are creating for key.
-                {
-                    // const suffixLen = key.len - j;
-                    // const suffix = try self.allocator.alloc(u8, suffixLen);
-                    // errdefer self.allocator.free(suffix);
-
-                    // Copy the string suffix over the new array
-                    // We do +1 because `j` points to the char where the two strings
-                    // diverge and that char will go in another intermediary branching
-                    // node.
-                    // std.mem.copy(u8, suffix, key[j..]);
-                    branchingNodePtr.layout.Branching[1] = NodeT.Branch{
-                        .char = key[j],
-                        .child = .{
-                            .nodeType = .Link,
-                            .layout = .{
-                                .Branching = &[0]NodeT.Branch{},
-                            },
-                        },
-                    };
-                    // TODO: is this always going to be like this?
-                    // try branchingNodePtr.layout.Branching[1].child.makeCompressed(self.allocator, suffix);
-                    // self.numNodes += 1;
+                if (j > 0) {
+                    // Trim the current node by removing the suffix + branching point and
+                    // set nextPtr to the new branching node just created.
+                    try self.trimCommonPrefixNode(currentNode, j, branchingNode);
                 }
 
-                // Trim the current node by removing the suffix + branching point and
-                // set nextPtr to the new branching node just created.
-                currentData.chars = self.allocator.shrink(currentData.chars, j);
-                currentData.nextPtr = branchingNodePtr;
-                self.numElements += 1;
-                currentNode = &branchingNodePtr.layout.Branching[1].child;
+                // Move the 'currentNode' reference to the new empty node created for
+                // the newSuffix and let the next code to deal with it.
+                currentNode = branchingNode.layout.Branching[newSuffixSlot].child;
                 i += 1;
+            } else if (currentNode.layout == .Compressed and i == key.len) {
+                var currentData = &currentNode.layout.Compressed;
+
+                // Child containing the current node's suffix.
+                var oldSuffixNode = try self.createSuffixForOldElement(currentNode, j);
+                try self.trimCommonPrefixNode(currentNode, j, oldSuffixNode);
+                currentNode = oldSuffixNode;
+                i = key.len;
             }
 
             while (i < key.len) {
@@ -243,26 +288,113 @@ pub fn Rax(comptime V: type) type {
 
                     // TODO: error handling procedure
                     try currentNode.makeCompressed(self.allocator, key[i..]);
-
+                    self.numNodes += 1;
                     i += chunkSize;
+                    currentNode = currentNode.layout.Compressed.next;
                 } else {
-                    std.debug.warn("char={c} node={}\n", .{ key[i], currentNode.* });
-                    unreachable;
-                }
-                self.numNodes += 1;
+                    const emptyNode = try NodeT.initEmpty(self.allocator);
+                    self.numNodes += 1;
 
-                currentNode = switch (currentNode.layout) {
-                    .Compressed => |c| c.nextPtr,
-                    .Branching => |b| &(b[0].child),
-                };
+                    errdefer {
+                        _ = emptyNode.deinit(self.allocator, 0);
+                    }
+
+                    const oldBranches = currentNode.layout.Branching;
+                    var newBranches = try self.allocator.alloc(NodeT.Branch, oldBranches.len + 1);
+
+                    var greaterThan = newBranches.len - 1;
+                    for (oldBranches) |b, x| {
+                        if (b.char > key[x]) {
+                            greaterThan = x;
+                            break;
+                        }
+                    }
+
+                    // TODO: break this up into 2 loops without ifs in them.
+                    for (newBranches) |*b, idx| {
+                        if (idx < greaterThan) {
+                            b.* = oldBranches[idx];
+                        }
+                        if (idx == greaterThan) {
+                            newBranches[idx] = .{
+                                .char = key[i],
+                                .child = emptyNode,
+                            };
+                        }
+                        if (idx > greaterThan) {
+                            b.* = oldBranches[idx - 1];
+                        }
+                    }
+
+                    self.allocator.free(oldBranches);
+                    currentNode.layout.Branching = newBranches;
+                    i += 1;
+                    currentNode = emptyNode;
+                }
             }
 
-            if (currentNode.nodeType == .Link) {
+            if (currentNode.key == null) {
                 self.numElements += 1;
             }
 
-            currentNode.nodeType = .{ .Key = value };
+            currentNode.key = value;
             return .New;
+        }
+
+        fn createSuffixForOldElement(self: *Self, currentNode: *NodeT, startPos: usize) !*NodeT {
+            var oldSuffixNode: *NodeT = undefined;
+            var currentData = &currentNode.layout.Compressed;
+            // If there's a suffix that we broke off from the original node,
+            // we need to allocate a new compressed node for it.
+            const oldSuffixLen = currentData.chars.len - startPos;
+            if (oldSuffixLen > 0) { // At least 1 char in suffix.
+                if (oldSuffixLen == 1) {
+                    // Single-char suffix means we create a branching child node
+                    // for it and then attach the current child as it's child
+                    // corresponding to the only present branch
+                    oldSuffixNode = try NodeT.initBranchNode(
+                        1,
+                        self.allocator,
+                        [1]u8{currentData.chars[startPos]},
+                        [1]*NodeT{currentData.next},
+                    );
+                    self.numNodes += 1;
+                } else {
+                    // Multiple chars in the suffix -> create compressed node.
+                    oldSuffixNode = try NodeT.initCompressedNode(
+                        self.allocator,
+                        currentData.chars[startPos..],
+                        currentData.next,
+                    );
+                    self.numNodes += 1;
+                }
+            } else {
+                // No suffix, we branched at the last char, so the child
+                // corresponding to this char is directly the old child (next)
+                oldSuffixNode = currentData.next;
+            }
+
+            return oldSuffixNode;
+        }
+
+        fn trimCommonPrefixNode(self: *Self, currentNode: *NodeT, j: usize, nextNode: *NodeT) !void {
+            var currentData = &currentNode.layout.Compressed;
+            if (j == 1) {
+                const firstLetter = currentData.chars[0];
+                self.allocator.free(currentData.chars);
+
+                var branches = try self.allocator.alloc(NodeT.Branch, 1);
+                branches[0] = .{
+                    .char = firstLetter,
+                    .child = nextNode,
+                };
+
+                // Change the layout of the prefix node to Branching
+                currentNode.layout = .{ .Branching = branches };
+            } else {
+                currentData.chars = self.allocator.shrink(currentData.chars, j);
+                currentData.next = nextNode;
+            }
         }
 
         // TODO: should s be named key? Do we ever search
@@ -276,7 +408,7 @@ pub fn Rax(comptime V: type) type {
         };
 
         fn lowWalk(self: *Self, s: []const u8) walkResult {
-            var node = &self.head;
+            var node = self.head;
 
             var i: usize = 0;
             var j: usize = 0;
@@ -306,8 +438,8 @@ pub fn Rax(comptime V: type) type {
                 }
 
                 node = switch (node.layout) {
-                    .Compressed => |c| c.nextPtr,
-                    .Branching => |b| &(b[j].child),
+                    .Compressed => |c| c.next,
+                    .Branching => |b| b[j].child,
                 };
 
                 j = 0;
@@ -321,7 +453,7 @@ pub fn Rax(comptime V: type) type {
         }
 
         pub fn show(self: *Self) void {
-            recursiveShow(0, 0, &self.head);
+            recursiveShow(0, 0, self.head);
             std.debug.warn("\n", .{});
         }
 
@@ -347,14 +479,11 @@ pub fn Rax(comptime V: type) type {
                 },
             }
 
-            switch (node.nodeType) {
-                else => {},
-                .Key => |value| {
-                    if (@TypeOf(value) != void) {
-                        std.debug.warn("={x}", .{value});
-                    }
-                    numchars += 4;
-                },
+            if (node.key) |value| {
+                if (@TypeOf(value) != void) {
+                    std.debug.warn("={}", .{value});
+                }
+                numchars += 4;
             }
 
             if (level > 0) {
@@ -371,7 +500,7 @@ pub fn Rax(comptime V: type) type {
             switch (node.layout) {
                 .Compressed => |compressed| {
                     std.debug.warn(" -> ", .{});
-                    recursiveShow(level + 1, lpad, compressed.nextPtr);
+                    recursiveShow(level + 1, lpad, compressed.next);
                 },
                 .Branching => |branches| {
                     for (branches) |*br, idx| {
@@ -383,7 +512,7 @@ pub fn Rax(comptime V: type) type {
                         } else {
                             std.debug.warn(" -> ", .{});
                         }
-                        recursiveShow(level + 1, lpad, &br.child);
+                        recursiveShow(level + 1, lpad, br.child);
                     }
                 },
             }
