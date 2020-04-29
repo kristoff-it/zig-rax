@@ -527,8 +527,8 @@ pub fn Rax(comptime V: type) type {
                     self.numNodes -= 1;
 
                     currentNode = treeStack.pop();
-                    const hasMoreChildren = currentNode.layout != .Compressed and currentNode.size() != 1;
-                    if (currentNode.key != null or hasMoreChildren) {
+                    const hasChildren = currentNode.layout == .Branching and currentNode.layout.Branching.len != 1;
+                    if (currentNode.key != null or hasChildren) {
                         break;
                     }
                 }
@@ -542,6 +542,118 @@ pub fn Rax(comptime V: type) type {
                 }
             } else if (size == 1) {
                 tryToCompress = true;
+            }
+
+            // TODO: no compression if oom
+
+            if (tryToCompress) {
+                var parent: *NodeT = undefined;
+                while (true) {
+                    parent = treeStack.pop(); // this is where we might be popping null from it
+                    const hasChildren = parent.layout == .Branching and parent.layout.Branching.len != 1;
+                    if (parent.key != null or hasChildren) {
+                        break;
+                    }
+
+                    currentNode = parent;
+                }
+
+                const startNode = currentNode;
+
+                var compressedSize = currentNode.size();
+                var nodes: u32 = 1;
+
+                // TODO: right now we repurpose currentNode even when
+                // it might make more sense to realloc another node that already
+                // is using more memory. Example:
+                //     `-(b) [a] -> "nana" -> []=3
+                // would it be worht it to try and remember which is the biggest node
+                // we encountered previously when running down the tree and realloc that
+                // instead of currentNode unconditionally?
+                while (currentNode.size() != 0) {
+                    currentNode = switch (currentNode.layout) {
+                        .Compressed => |c| c.next,
+                        .Branching => |b| b[b.len - 1].child, // TODO: does it have to be the last? why not the first?
+                    };
+
+                    const hasChildren = currentNode.layout == .Branching and currentNode.layout.Branching.len != 1;
+                    if (currentNode.key != null or hasChildren) {
+                        break;
+                    }
+
+                    if (compressedSize + currentNode.size() > std.math.maxInt(usize)) {
+                        break;
+                    }
+
+                    nodes += 1;
+                    compressedSize += currentNode.size();
+                }
+
+                // This is the last node we visited, which is the first
+                // node that will *NOT* be compressed.
+                const lastNode = currentNode;
+
+                if (nodes > 1) {
+                    // Save startNode's child pointer because we need it
+                    // and we're about to clobber the node's layout.
+                    // Realloc chars in startNode to make space for
+                    // all the extra chars coming from its children.
+                    var startNodeCharCount: usize = undefined;
+                    switch (startNode.layout) {
+                        .Compressed => |*c| {
+                            currentNode = c.next;
+                            startNodeCharCount = c.chars.len;
+
+                            c.chars = try self.allocator.realloc(c.chars, compressedSize);
+                            c.next = lastNode;
+                        },
+                        .Branching => |b| {
+                            const branch = b[b.len - 1];
+                            startNodeCharCount = 1;
+
+                            currentNode = branch.child; // TODO: does it have to be the last? why not the first?
+                            self.allocator.free(b);
+                            startNode.layout = .{
+                                .Compressed = .{
+                                    .chars = try self.allocator.alloc(u8, compressedSize),
+                                    .next = lastNode,
+                                },
+                            };
+                            startNode.layout.Compressed.chars[0] = branch.char;
+                        },
+                    }
+
+                    // Run down the compressable path again,
+                    // but this time we copy over chars & free nodes
+                    // as we go.
+                    const newChars = startNode.layout.Compressed.chars;
+                    while (true) {
+                        // Copy chars and move down
+                        const oldNode = currentNode;
+                        switch (currentNode.layout) {
+                            .Compressed => |c| {
+                                std.mem.copy(u8, newChars[startNodeCharCount..], c.chars);
+                                startNodeCharCount += c.chars.len;
+                                currentNode = c.next;
+                                self.allocator.free(c.chars);
+                            },
+                            .Branching => |b| {
+                                const branch = b[b.len - 1]; // TODO: does it have to be the last? why not the first?
+                                newChars[startNodeCharCount] = branch.char;
+                                startNodeCharCount += 1;
+                                currentNode = branch.child;
+                                self.allocator.free(b);
+                            },
+                        }
+                        self.allocator.destroy(oldNode);
+                        self.numNodes -= 1;
+
+                        // We stop once we reach the previously identified lastNode.
+                        if (currentNode == lastNode) {
+                            break;
+                        }
+                    }
+                }
             }
 
             return result;

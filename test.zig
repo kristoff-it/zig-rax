@@ -25,5 +25,11 @@ pub fn main() !void {
     _ = try r.remove("annibale");
     _ = try r.remove("berry");
     _ = try r.remove("b");
+    _ = try r.remove("straw");
+    switch (try r.remove("each")) {
+        .Nothing => {},
+        .Found => @panic("???"),
+    }
+
     r.show();
 }
