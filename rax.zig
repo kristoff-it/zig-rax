@@ -1,5 +1,64 @@
 const std = @import("std");
 
+fn RaxStack(comptime NodeT: type, comptime StaticSize: usize) type {
+    return struct {
+        maxItems: usize,
+        staticItems: [StaticSize]*NodeT,
+        stack: []*NodeT,
+
+        const Self = @This();
+        fn init(self: *Self) void {
+            self.* = Self{
+                .maxItems = StaticSize,
+                .staticItems = undefined,
+                .stack = &self.staticItems,
+            };
+
+            self.stack.len = 0;
+        }
+
+        fn deinit(self: *Self, allocator: *std.mem.Allocator) void {
+            if (self.stack.ptr != &self.staticItems) {
+                allocator.free(self.stack);
+            }
+        }
+
+        // The self.stack slice has a lenght always corresponding to the
+        // number of pointers stored in the backing array. Since we allocate
+        // space for those in bulk (by doubling the current maxItems value),
+        // when adding new items we also manipulate the slice's `.len` field.
+        // This means that we use the slice unsafely in .push and .pop, but in
+        // exchange external uses can just use the slice normally and be sure
+        // that they won't read undefined values (aka garbage).
+        fn push(self: *Self, allocator: *std.mem.Allocator, item: *NodeT) !void {
+            if (self.stack.len == self.maxItems) {
+                if (self.stack.ptr == &self.staticItems) {
+                    self.stack = try allocator.alloc(*NodeT, self.maxItems * 2);
+                    std.mem.copy(*NodeT, self.stack, &self.staticItems);
+                    self.stack.len = self.maxItems;
+                } else {
+                    self.stack = try allocator.realloc(self.stack, self.maxItems * 2);
+                    self.stack.len = self.maxItems;
+                }
+                self.maxItems *= 2;
+            }
+            self.stack.ptr[self.stack.len] = item;
+            self.stack.len += 1;
+        }
+
+        fn pop(self: *Self) *NodeT {
+            if (self.stack.len == 0) @panic("tried to pop from an empty stack");
+            self.stack.len -= 1;
+            return self.stack.ptr[self.stack.len];
+        }
+
+        fn peek(self: *Self) ?*NodeT {
+            if (self.stack.len == 0) return null;
+            return self.stack.ptr[self.stack.len - 1];
+        }
+    };
+}
+
 fn RaxNode(comptime V: type) type {
     return struct {
         key: ?V,
@@ -110,11 +169,49 @@ fn RaxNode(comptime V: type) type {
                 },
             };
         }
+
+        fn removeChild(self: *Self, allocator: *std.mem.Allocator, child: *Self) void {
+            switch (self.layout) {
+                .Compressed => |c| {
+                    // TODO: make this debug-only
+                    if (c.next != child) {
+                        @panic("tried to remove a child that was not present in the parent");
+                    }
+
+                    allocator.free(c.chars);
+                    self.layout = .{ .Branching = &[0]Self.Branch{} };
+                },
+                .Branching => |branches| {
+                    var childIdx = branches.len;
+                    for (branches) |b, i| {
+                        if (b.child == child) {
+                            childIdx = i;
+                            break;
+                        }
+                    }
+
+                    if (childIdx != branches.len) {
+                        std.mem.copy(Self.Branch, branches[childIdx..], branches[(childIdx + 1)..]);
+                        self.layout.Branching = allocator.shrink(branches, branches.len - 1);
+                    } else {
+                        @panic("tried to remove a child that was not present in the parent");
+                    }
+                },
+            }
+        }
+
+        fn size(self: Self) usize {
+            return switch (self.layout) {
+                .Compressed => |c| c.chars.len,
+                .Branching => |b| b.len,
+            };
+        }
     };
 }
 
 pub fn Rax(comptime V: type) type {
     const NodeT = comptime RaxNode(V);
+    const StackT = comptime RaxStack(NodeT, 32);
 
     return struct {
         allocator: *std.mem.Allocator,
@@ -140,20 +237,20 @@ pub fn Rax(comptime V: type) type {
             }
         }
 
-        pub const InsertResult = union(enum) {
-            New,
-            Replaced: V,
+        pub const OperationResult = union(enum) {
+            Nothing,
+            Found: V,
         };
 
-        pub fn insert(self: *Self, key: []const u8, value: V) !InsertResult {
+        pub fn insert(self: *Self, key: []const u8, value: V) !OperationResult {
             return insertImpl(self, key, value, false);
         }
-        pub fn insertOverride(self: *Self, key: []const u8, value: V) !InsertResult {
+        pub fn insertOverride(self: *Self, key: []const u8, value: V) !OperationResult {
             return insertImpl(self, key, value, true);
         }
 
         // TODO: override is not comptime. Should it be?
-        fn insertImpl(self: *Self, key: []const u8, value: V, override: bool) !InsertResult {
+        fn insertImpl(self: *Self, key: []const u8, value: V, override: bool) !OperationResult {
             var wk = self.lowWalk(key);
 
             var i = wk.bytesMatched;
@@ -172,11 +269,11 @@ pub fn Rax(comptime V: type) type {
                     if (override) {
                         currentNode.key = value;
                     }
-                    return InsertResult{ .Replaced = oldValue };
+                    return OperationResult{ .Found = oldValue };
                 } else {
                     currentNode.key = value;
                     self.numElements += 1;
-                    return .New;
+                    return .Nothing;
                 }
             }
 
@@ -272,10 +369,7 @@ pub fn Rax(comptime V: type) type {
             }
 
             while (i < key.len) {
-                const isEmpty = switch (currentNode.layout) {
-                    .Compressed => |c| c.chars.len == 0,
-                    .Branching => |b| b.len == 0,
-                };
+                const isEmpty = currentNode.size() == 0;
 
                 if (isEmpty and key.len - i > 1) {
                     var chunkSize = key.len - i;
@@ -338,7 +432,7 @@ pub fn Rax(comptime V: type) type {
             }
 
             currentNode.key = value;
-            return .New;
+            return .Nothing;
         }
 
         fn createSuffixForOldElement(self: *Self, currentNode: *NodeT, startPos: usize) !*NodeT {
@@ -397,17 +491,82 @@ pub fn Rax(comptime V: type) type {
             }
         }
 
+        /// Removes a key from the tree. The return value will contain
+        /// the value corresponding to the removed key, if the key was found.
+        pub fn remove(self: *Self, key: []const u8) !OperationResult {
+            var treeStack: StackT = undefined;
+            treeStack.init();
+            defer treeStack.deinit(self.allocator);
+
+            const wr = try self.lowWalkStack(key, &treeStack);
+            var i = wr.bytesMatched;
+            var currentNode = wr.stopNode;
+            const splitPos = wr.splitPos;
+
+            // No match was found
+            {
+                const middleOfCompressedNode = currentNode.layout == .Compressed and splitPos != 0;
+                if (i != key.len or middleOfCompressedNode or currentNode.key == null) {
+                    return .Nothing;
+                }
+            }
+
+            const result = OperationResult{ .Found = currentNode.key.? };
+
+            currentNode.key = null;
+            self.numElements -= 1;
+
+            var tryToCompress = false;
+
+            const size = currentNode.size();
+            if (size == 0) {
+                var child = currentNode;
+                while (currentNode != self.head) {
+                    child = currentNode;
+                    _ = child.deinit(self.allocator, 0);
+                    self.numNodes -= 1;
+
+                    currentNode = treeStack.pop();
+                    const hasMoreChildren = currentNode.layout != .Compressed and currentNode.size() != 1;
+                    if (currentNode.key != null or hasMoreChildren) {
+                        break;
+                    }
+                }
+
+                // We now need to remove a reference to the last freed child
+                // from the parent node currently pointed to by currentNode.
+                // (Original code checked here if child is not null.)
+                currentNode.removeChild(self.allocator, child);
+                if (currentNode.size() == 1 and currentNode.key == null) {
+                    tryToCompress = true;
+                }
+            } else if (size == 1) {
+                tryToCompress = true;
+            }
+
+            return result;
+        }
+
         // TODO: should s be named key? Do we ever search
         // for "partials"?
         // TODO: is returning a struct better or worse than
         //       writing to pointers?
-        const walkResult = struct {
+        const WalkResult = struct {
             bytesMatched: usize,
             stopNode: *NodeT,
             splitPos: usize, // In real impl it's u29
         };
 
-        fn lowWalk(self: *Self, s: []const u8) walkResult {
+        fn lowWalk(self: *Self, s: []const u8) WalkResult {
+            return self.lowWalkImlp(s, null) catch unreachable;
+        }
+
+        fn lowWalkStack(self: *Self, s: []const u8, treeStack: *StackT) !WalkResult {
+            return self.lowWalkImlp(s, treeStack);
+        }
+
+        // This function cannot fail if no treeStack is provided.
+        fn lowWalkImlp(self: *Self, s: []const u8, treeStack: ?*StackT) !WalkResult {
             var node = self.head;
 
             var i: usize = 0;
@@ -437,6 +596,10 @@ pub fn Rax(comptime V: type) type {
                     },
                 }
 
+                // If a stack was provided, push the visited
+                // node's pointer into it.
+                if (treeStack) |ts| try ts.push(self.allocator, node);
+
                 node = switch (node.layout) {
                     .Compressed => |c| c.next,
                     .Branching => |b| b[j].child,
@@ -445,7 +608,7 @@ pub fn Rax(comptime V: type) type {
                 j = 0;
             }
 
-            return walkResult{
+            return WalkResult{
                 .bytesMatched = i,
                 .stopNode = node,
                 .splitPos = j,
