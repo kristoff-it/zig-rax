@@ -1,5 +1,5 @@
 const std = @import("std");
-const Rax = @import("./rax.zig").Rax;
+const Rax = @import("./src/simple/rax.zig").Rax;
 
 pub fn main() !void {
     const MyRax = Rax(i64);
@@ -21,15 +21,13 @@ pub fn main() !void {
     _ = try r.insert("p", 13);
     r.show();
 
-    std.debug.warn("\n\n", .{});
-    _ = try r.remove("annibale");
-    _ = try r.remove("berry");
-    _ = try r.remove("b");
-    _ = try r.remove("straw");
-    switch (try r.remove("each")) {
-        .Nothing => {},
-        .Found => @panic("???"),
-    }
+    var it: MyRax.IterT = undefined;
+    it.init(&r);
 
-    r.show();
+    try it.seek(.Eq, "banana");
+    std.debug.warn("Result = {}\n", .{try it.next()});
+    std.debug.warn("Result = {}\n", .{try it.next()});
+    std.debug.warn("Result = {}\n", .{try it.next()});
+    // std.debug.warn("Result = {}\n", .{try it.next()});
+    // std.debug.warn("Result = {}\n", .{try it.next()});
 }
