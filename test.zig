@@ -25,9 +25,9 @@ pub fn main() !void {
     it.init(&r);
 
     try it.seek(.Eq, "banana");
-    std.debug.warn("Result = {}\n", .{try it.next()});
-    std.debug.warn("Result = {}\n", .{try it.next()});
-    std.debug.warn("Result = {}\n", .{try it.next()});
+    std.debug.warn("Result = {} key= {}\n", .{ try it.next(), it.key });
+    std.debug.warn("Result = {} key= {}\n", .{ try it.next(), it.key });
+    std.debug.warn("Result = {} key= {}\n", .{ try it.next(), it.key });
     // std.debug.warn("Result = {}\n", .{try it.next()});
     // std.debug.warn("Result = {}\n", .{try it.next()});
 }
